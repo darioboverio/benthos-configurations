@@ -1,11 +1,11 @@
 input:
   label: api_template_trigger
   generate:
-    mapping: root = ""
+    mapping: root = "main"
     count: 1
 pipeline:
   processors:
     - log:
         level: INFO
-        message: demo dynamic benthos configuration
+        message: logging main configuration
 
