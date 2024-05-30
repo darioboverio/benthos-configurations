@@ -1,11 +1,6 @@
-input:
-  label: api_template_trigger
-  generate:
-    mapping: root = "vendor"
-    count: 1
-pipeline:
-  processors:
-    - log:
-        level: INFO
-        message: logging vendor configuration
+processor_resources:
+  - label: vendor_extraction_pipeline
+    log:
+      level: INFO
+      message: cron execution with id = ${! meta("batch_id") } at ${! meta("fixed_timestamp") }
 

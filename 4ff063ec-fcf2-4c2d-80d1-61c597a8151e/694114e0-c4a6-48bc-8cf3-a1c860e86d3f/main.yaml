@@ -1,11 +1,12 @@
+# The input it's just a trigger where we need to call this pipeline only once
 input:
   label: api_template_trigger
   generate:
-    mapping: root = "main"
     count: 1
+    mapping: |
+      meta batch_id = uuid_v4()
+      meta fixed_timestamp = timestamp_unix().ts_strftime("%Y-%m-%d")
+
 pipeline:
   processors:
-    - log:
-        level: INFO
-        message: logging main configuration
-
+    - resource: cron_execution_logger
