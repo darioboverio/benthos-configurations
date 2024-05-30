@@ -1,5 +1,5 @@
 processor_resources:
-  - label: vendor_extraction_pipeline
+  - label: cron_execution_logger
     log:
       level: INFO
       message: cron execution with id = ${! meta("batch_id") } at ${! meta("fixed_timestamp") }
