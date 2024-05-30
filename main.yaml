@@ -1,0 +1,143 @@
+# The input it's just a trigger where we need to call this pipeline only once
+input:
+  label: api_template_trigger
+  generate:
+    count: 1
+    mapping: |
+      meta batch_id = uuid_v4()
+      meta fixed_timestamp = timestamp_unix().ts_strftime("%Y-%m-%d")
+
+pipeline:
+  processors:
+    - try:
+      - metric:
+          name: api_template_time
+          type: timing
+          value: ${! timestamp_unix() }
+          labels:
+            process: start
+
+      - log:
+          level: INFO
+          message: starting extraction process, batch_id ==> ${! meta("batch_id") }
+      
+      - label: integration_attributes_extraction_workflow
+        branch:
+          processors:
+            - http:
+                url: ${XORG_URL}/integrations?type=${INTEGRATION_TYPE}&organization-id=${ORGANIZATION_ID}&employer-id=${EMPLOYER_ID}&vendor=${VENDOR}
+                verb: GET
+                timeout: 20s
+                successful_on:
+                  - 200
+                retries: 3
+                retry_period: 1s
+                drop_on:
+                  - 400
+                  - 401
+                  - 403
+                  - 500
+          result_map: |-
+            meta attributes = if this.length() == 0 {
+              throw("missing api integration attributes")
+            } else {
+              this.index(0).attributes.map_each(att -> {
+                att.key : att.value
+              }).squash()
+            }
+
+      - resource: vendor_extraction_pipeline
+      
+      # We declare a generic mapping workflow processor so we can do some operations with the extracted data 
+      - resource: generic_mapping_workflow
+      
+      - metric:
+          name: api_template_time
+          type: timing
+          value: ${! timestamp_unix() }
+          labels:
+            process: end
+
+output:
+  broker:
+    outputs:
+      - label: api_template_bucket_vendor
+        drop_on:
+          error: true
+          output:
+            aws_s3:
+              region: "us-east-1"
+              bucket: ${VENDOR_FILES_BUCKET}
+              path: ${VENDOR}/${ORGANIZATION}/${! meta("fixed_timestamp") }_${!  meta("batch_id") }_ee.json
+              timeout: 5m
+      - label: api_template_bucket_rain
+        drop_on:
+          error: true
+          output:
+            aws_s3:
+              region: "us-east-1"
+              bucket: ${NDI_EE_FILES_BUCKET}
+              path: ${ORGANIZATION_ID}/${EMPLOYER_ID}/${! meta("fixed_timestamp") }_${!  meta("batch_id") }_ee.csv
+              timeout: 5m
+            processors:
+              - try:
+                - metric:
+                    name: eligible_employees
+                    type: counter_by
+                    value: ${! this.length() }
+                - label: convert_json_to_csv
+                  mapping: |
+                  
+                    let headers = this.index(0).keys().sort().map_each(
+                      field -> field.re_replace_all("[A-Z0-9]+", "_$0").lowercase()
+                    ).join(",")
+                    let rows = this.map_each(
+                      employee -> employee.key_values().sort_by(pair -> pair.key).map_each(
+                          field -> field.value.(this | "").string()
+                        ).map_each(
+                          field -> if field.contains(",") { "\"%s\"".format(field) } else {field}
+                        ).join(",")
+                      ).join("\n")  
+                    root = $headers + "\n" + $rows
+
+cache_resources:
+  - label: in_memory_cache
+    memory:
+      default_ttl: 60m
+
+metrics:
+  mapping: |
+
+    # Delete all metric series that aren't in our list
+    root = if ![
+      "api_template_time",
+      "eligible_employees",
+      "endpoint_response_count",
+      "cache_success",
+      "cache_error",
+      "processor_error",
+      "processor_latency_ns",
+      "http_request_code_2xx",
+    ].contains(this) { deleted() }
+
+    # Add labels to all metrics        
+    meta vendor = "${VENDOR}"
+    meta company = "${ORGANIZATION}"
+  prometheus:
+    push_interval: 1s
+    push_job_name: benthos_push
+    push_url: "${PUSH_GATEWAY_URL}"
+    add_process_metrics: true
+
+rate_limit_resources:
+  - label: rate_limit
+    local:
+      count: 2
+      interval: 1m
+
+logger:
+  level: INFO
+  format: logfmt
+  static_fields:
+    'VENDOR': ${VENDOR}
+    'ORGANIZATION': ${ORGANIZATION}

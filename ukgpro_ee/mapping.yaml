@@ -1,0 +1,71 @@
+processor_resources:
+  - label: generic_mapping_workflow
+    branch:
+      request_map: 'root = this'
+      processors:
+        - unarchive:
+            format: json_array
+
+        - branch:
+            processors:
+              - cached:
+                  key: 'cached_mapping'
+                  cache: in_memory_cache
+                  processors:
+                    - label: mappings_api
+                      http:
+                        url: ${XORG_URL}/api-template-mappings?integration-type=${INTEGRATION_TYPE}&organization-id=${ORGANIZATION_ID}&employer-id=${EMPLOYER_ID}&vendor-code=${VENDOR}
+                        verb: GET
+                        timeout: 20s
+                        successful_on:
+                          - 200
+                        retries: 3
+                        retry_period: 1s
+                        drop_on:
+                          - 400
+                          - 401
+                          - 403
+                          - 500
+            result_map: 'root.mappings = this.mappings'
+
+        - label: javascript_mapping_processor
+          javascript: 
+            code: | 
+              function getJSONValue(obj, path) {
+                  return path.split('.').reduce((currentObject, key) => {
+                      return currentObject ? currentObject[key] : "";
+                  }, obj);
+              }
+
+              function getLastPart(path) {
+                  return path.split('.').pop();
+              }
+
+              function transformJson(inputJson, mappings) {
+                let outputJson = {};
+                mappings.forEach(mapping => {
+                  try {
+                      const args = (mapping.arguments ?? []).map(arg => getJSONValue(inputJson, arg));;
+                      const parameters = (mapping.arguments ?? []).map(arg => getLastPart(arg));
+                      const dynamicFunction = new Function(...parameters, decodeURIComponent(mapping.expression));
+                      outputJson[mapping.attribute_name] = dynamicFunction(...args)
+                    } catch(e) {
+                      console.error("error applying the mapping in the attribute " + mapping.attribute_name + " : " + e.message)
+                    } 
+                });
+                return outputJson;
+              }
+
+              var message = benthos.v0_msg_as_structured()
+              var mappings = message.mappings
+              
+              if (mappings && mappings.length > 0) {
+                message = transformJson(message, mappings)
+              }
+              message["batch_id"] = benthos.v0_msg_get_meta("batch_id")
+              benthos.v0_msg_set_structured(message)
+
+        - archive:
+            format: json_array
+
+      result_map: 'root = this'

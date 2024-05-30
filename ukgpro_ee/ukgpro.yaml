@@ -1,0 +1,256 @@
+processor_resources:
+  # UKG Pro workflow definition
+  - label: vendor_extraction_pipeline
+    branch:
+      processors:
+        - resource: map_ukgpro_attributes
+
+        - label: ukgpro_api_integration_extractor 
+          while:
+            at_least_once: true
+            check: "this.companies_length != null && this.companies_length > 0"  
+            processors:
+              - branch:
+                  processors:
+                    - label: company_details
+                      http:
+                        url: ${! meta("ukgproURL") }/configuration/v1/company-details?page=${! count("companies_page") }&per_Page=1&addressCountry=USA
+                        verb: GET
+                        timeout: 20s
+                        successful_on:
+                          - 200
+                        retries: 3
+                        retry_period: 1s
+                        drop_on:
+                          - 400
+                          - 401
+                          - 403
+                          - 500
+                        headers:
+                          US-Customer-Api-Key: ${! meta("ukgproCustomerApiKey") }
+                          Authorization: Basic ${! meta("ukgproBasicAuth") }
+
+                  result_map: |-
+                    root.companies_length = this.length()
+                    root.companies = if this.length() > 0 {
+                      root.(companies | []).concat(this)
+                    }
+                    root.companyId = if this.length() > 0 {
+                      this.index(0).companyId
+                    }
+              - switch:
+                - check: "this.companies_length != null && this.companies_length > 0" 
+                  processors:
+                    - try:
+                      - resource: set_company_id
+                      - resource: set_employments_page
+                      - resource: set_personal_page
+                      - resource: get_employment_details
+                      - resource: get_personal_details
+                - processors:
+                  - label: finished_data_extraction
+                    log:
+                      level: INFO
+                      message: data extraction finished, starting data merge
+
+                  - label: ukgpro_data_merge
+                    bloblang: |
+                      map remove_temporary_object_fields {
+                        root = this.map_each(e -> e.merge(e.personal_details).without("personal_details"))
+                      }
+
+                      root = {}
+                      root = this.personal_details.map_each(pd -> {
+                            "personal_details" : pd,
+                            "company_details" : this.companies.filter(c -> c.companyId == pd.companyId),
+                            "employment_details" : this.employment_details.filter(e -> e.employeeID == pd.employeeId).sort_by(em -> em.lastHireDate).index(-1)
+                          } 
+                      ).apply("remove_temporary_object_fields")
+      result_map: root = this
+
+  - label:  map_ukgpro_attributes
+    bloblang: |
+      let attributes = meta("attributes").parse_json()
+      meta ukgproCustomerApiKey = $attributes.customer_api_key
+      meta ukgproBasicAuth = ( $attributes.username + ":" + $attributes.password ).encode("base64")
+      meta ukgproURL = $attributes.url
+
+  - label: set_company_id
+    branch:
+      processors:
+        - cache:
+            operator: set
+            resource: in_memory_cache
+            key:  'company_id'
+            value: '${! json("companyId") }'
+
+  - label: set_employments_page
+    branch:
+      processors:
+        - cache:
+            operator: set
+            resource: in_memory_cache
+            key: 'employments_page' 
+            value: 1
+
+  - label: set_personal_page
+    branch:
+      processors:
+        - cache:
+            operator: set
+            resource: in_memory_cache
+            key: 'personal_page' 
+            value: 1
+  
+  - label: get_employment_details
+    branch:
+      processors:
+        - branch:
+            processors:
+              - cache:
+                  operator: get
+                  resource: in_memory_cache
+                  key: 'company_id'
+            result_map: meta company_id = content()
+
+        - label: extracting_employments_details_paginated
+          while:
+            at_least_once: true
+            check: "this.employment_details_length > 0"
+            processors:
+              - label: extracting_employment_page
+                branch:
+                  processors:
+                    - cache:
+                        operator: get
+                        resource: in_memory_cache
+                        key: 'employments_page'
+                  result_map: "meta employments_page = content()"
+
+              # Log with employment details information
+              - label: loggin_employments_request
+                log:
+                  level: INFO
+                  message: page => ${! meta("employments_page") }, companyID => ${! meta("company_id") }
+      
+              # HTTP processor to call the employment details endpoint in a paginated mode
+              - label: calling_employment_endpoint
+                branch:
+                  processors:
+                    - label: employee_employment_details
+                      http:
+                        url: ${! meta("ukgproURL") }/personnel/v1/employee-employment-details?per_Page=${PER_PAGE}&page=${! meta("employments_page") }&companyId=${! meta("company_id") }
+                        verb: GET
+                        timeout: 5m
+                        rate_limit: rate_limit
+                        successful_on:
+                          - 200
+                        retries: 3
+                        retry_period: 1s
+                        drop_on:
+                          - 400
+                          - 401
+                          - 403
+                          - 500
+                        headers:
+                          US-Customer-Api-Key: ${! meta("ukgproCustomerApiKey") }
+                          Authorization: Basic ${! meta("ukgproBasicAuth") }
+                    - metric:
+                        name: endpoint_response_count
+                        type: counter_by
+                        value: ${! this.length() }
+                        labels:
+                          endpoint: employment_details
+
+                  result_map: |
+                    #!blobl 
+                    root.employment_details_length = this.length()
+                    root.employment_details = if this.length() > 0 {
+                      root.(employment_details | []).concat(this)  
+                    }
+
+              # After the iteration, I need to increment the page for next time
+              - cache:
+                  operator: set
+                  resource: in_memory_cache
+                  key: 'employments_page'
+                  value: '${! meta("employments_page").number() + 1 }'
+      result_map: 'root.employment_details = this.employment_details'
+  
+  - label: get_personal_details
+    branch:
+      request_map: 'root = this'
+      processors:
+        - branch:
+            processors:
+              - cache:
+                  operator: get
+                  resource: in_memory_cache
+                  key: 'company_id'
+            result_map: meta company_id = content()
+        - label: extracting_personal_details_paginated
+          while:
+            at_least_once: true
+            max_loops: 10
+            check: "this.personal_details_length > 0"
+            processors:
+              - branch:
+                  processors:
+                    # Getting the current page I need to use from the Cache
+                    - cache:
+                        operator: get
+                        resource: in_memory_cache
+                        key: 'personal_page'
+                  result_map: "meta personal_page = content()"
+
+              # Branch processor to enrich the original message with personal details information
+              - branch:
+                  request_map: ""
+                  processors:
+                    # Just logging the variables we are using on each pagination
+                    - label: loggin_personal_request
+                      log:
+                        level: INFO
+                        message: page => ${! meta("personal_page") }, companyID => ${! meta("company_id") }
+
+                    # HTTP processor to call the personal details endpoint in a paginated mode
+                    - label: personal_details
+                      http:
+                        url: ${! meta("ukgproURL") }/personnel/v1/person-details?per_Page=${PER_PAGE}&companyId=${! meta("company_id") }&page=${! meta("personal_page") }&addressCountry=USA
+                        verb: GET
+                        timeout: 5m
+                        rate_limit: rate_limit
+                        successful_on:
+                          - 200
+                        retries: 3
+                        retry_period: 1s
+                        drop_on:
+                          - 400
+                          - 401
+                          - 403
+                          - 500
+                        headers:
+                          US-Customer-Api-Key: ${! meta("ukgproCustomerApiKey") }
+                          Authorization: Basic ${! meta("ukgproBasicAuth") }
+
+                    - metric:
+                        name: endpoint_response_count
+                        type: counter_by
+                        value: ${! this.length() }
+                        labels:
+                          endpoint: personal_details
+
+                  result_map: |
+                    #!blobl
+                    root.personal_details_length = this.length()
+                    root.personal_details = if this.length() > 0 {
+                      root.(personal_details | []).concat(this)
+                    }
+
+              # After the iteration, I need to increment the page for next time
+              - cache:
+                  operator: set
+                  resource: in_memory_cache
+                  key: 'personal_page'
+                  value: '${! meta("personal_page").number() + 1 }'
+      result_map: 'root.personal_details = this.personal_details'
